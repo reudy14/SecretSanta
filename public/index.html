@@ -85,6 +85,8 @@
     </style>
 </head>
 <body>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/node-forge@1.3.1/dist/forge.min.js"></script>
     <div class="snow" id="snow"></div>
     
     <div class="content min-h-screen flex items-center justify-center p-4">
@@ -192,6 +194,28 @@
         
         createSnowflakes();
         
+        // Derive deterministic RSA key pair from password (same as room.html)
+        function deriveKeyPairFromPassword(username, password, roomId) {
+            const seed = username + password + roomId;
+            const keyMaterial = CryptoJS.PBKDF2(seed, 'secret-santa-salt-2025', {
+                keySize: 512/32,
+                iterations: 1000
+            }).toString();
+            const seedBytes = forge.util.hexToBytes(keyMaterial);
+            const prng = forge.random.createInstance();
+            prng.seedFileSync = () => seedBytes;
+            const keypair = forge.pki.rsa.generateKeyPair({
+                bits: 2048,
+                prng: prng,
+                workers: 0
+            });
+            return keypair;
+        }
+        
+        function exportPublicKey(publicKey) {
+            return forge.pki.publicKeyToPem(publicKey);
+        }
+        
         // Form submission
         document.getElementById('roomForm').addEventListener('submit', async (e) => {
             e.preventDefault();
@@ -200,8 +224,22 @@
             const hostUsername = document.getElementById('hostUsername').value;
             const hostPassword = document.getElementById('hostPassword').value;
             const autoJoinHost = document.getElementById('autoJoinHost').checked;
+            const submitButton = e.target.querySelector('button[type="submit"]');
             
             try {
+                submitButton.disabled = true;
+                
+                let hostPublicKey = null;
+                
+                // Generate public key if auto-joining
+                if (autoJoinHost) {
+                    submitButton.textContent = 'Generating encryption keys...';
+                    // We need the roomId first, so we'll generate a temporary one
+                    // Actually, we need to create room first, then register. Let's change approach.
+                }
+                
+                submitButton.textContent = 'Creating room...';
+                
                 const response = await fetch('/api/rooms', {
                     method: 'POST',
                     headers: {
@@ -211,27 +249,59 @@
                         name: roomName,
                         hostUsername,
                         hostPassword,
-                        autoJoinHost
+                        autoJoinHost: false  // Never auto-join on creation
                     })
                 });
                 
                 const data = await response.json();
                 
                 if (response.ok) {
+                    const roomId = data.roomId;
+                    
+                    // If auto-join was checked, register the host
+                    if (autoJoinHost) {
+                        submitButton.textContent = 'Generating encryption keys...';
+                        
+                        // Generate RSA keypair
+                        const keypair = deriveKeyPairFromPassword(hostUsername, hostPassword, roomId);
+                        const publicKeyPem = exportPublicKey(keypair.publicKey);
+                        
+                        submitButton.textContent = 'Registering host...';
+                        
+                        // Register host as participant
+                        const registerResponse = await fetch(`/api/rooms/${roomId}/register`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                username: hostUsername,
+                                password: hostPassword,
+                                publicKey: publicKeyPem
+                            })
+                        });
+                        
+                        if (!registerResponse.ok) {
+                            const regError = await registerResponse.json();
+                            alert('Room created but failed to register host: ' + regError.error);
+                        }
+                    }
+                    
                     // Show success message
                     document.getElementById('roomUrl').value = data.roomUrl;
-                    document.getElementById('goToRoom').href = `/room/${data.roomId}`;
+                    document.getElementById('goToRoom').href = `/room/${roomId}`;
                     document.getElementById('result').classList.remove('hidden');
                     document.getElementById('result').scrollIntoView({ behavior: 'smooth' });
                     
                     // Save host credentials temporarily for auto-login
-                    sessionStorage.setItem(`hostUser_${data.roomId}`, hostUsername);
-                    sessionStorage.setItem(`hostPass_${data.roomId}`, hostPassword);
+                    sessionStorage.setItem(`hostUser_${roomId}`, hostUsername);
+                    sessionStorage.setItem(`hostPass_${roomId}`, hostPassword);
                 } else {
                     alert('Error: ' + data.error);
                 }
             } catch (error) {
                 alert('Error creating room: ' + error.message);
+            } finally {
+                submitButton.disabled = false;
+                submitButton.textContent = '🎁 Create Room';
             }
         });
         

@@ -259,7 +259,18 @@
     </div>
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/node-forge@1.3.1/dist/forge.min.js"></script>
     <script>
+        // Verify libraries loaded
+        if (typeof forge === 'undefined') {
+            alert('Failed to load encryption library. Please refresh the page.');
+            throw new Error('forge library not loaded');
+        }
+        if (typeof CryptoJS === 'undefined') {
+            alert('Failed to load crypto library. Please refresh the page.');
+            throw new Error('CryptoJS library not loaded');
+        }
+        
         // Create snowflakes
         function createSnowflakes() {
             const snow = document.getElementById('snow');
@@ -289,58 +300,54 @@
         let currentRoom = null;
         let isHost = false;
         
-        // Derive encryption key from password
-        function deriveKey(password) {
-            return CryptoJS.SHA256(password).toString();
+        // Derive deterministic RSA key pair from password
+        function deriveKeyPairFromPassword(username, password, roomId) {
+            // Create deterministic seed
+            const seed = username + password + roomId;
+            
+            // Use PBKDF2 to derive strong key material (this will be the same for same inputs)
+            const keyMaterial = CryptoJS.PBKDF2(seed, 'secret-santa-salt-2025', {
+                keySize: 512/32,
+                iterations: 1000
+            }).toString();
+            
+            // Convert hex string to bytes
+            const seedBytes = forge.util.hexToBytes(keyMaterial);
+            
+            // Create a deterministic PRNG
+            const prng = forge.random.createInstance();
+            prng.seedFileSync = () => seedBytes;
+            
+            // Generate RSA key pair (will be the same for same seed)
+            const keypair = forge.pki.rsa.generateKeyPair({
+                bits: 2048,
+                prng: prng,
+                workers: 0
+            });
+            
+            return keypair;
         }
         
-        // Encrypt data
-        function encryptData(data, password) {
-            const key = deriveKey(password);
-            return CryptoJS.AES.encrypt(data, key).toString();
+        // Export public key to PEM format
+        function exportPublicKey(publicKey) {
+            return forge.pki.publicKeyToPem(publicKey);
         }
         
-        // Decrypt data
-        function decryptData(encryptedData, password) {
+        // Decrypt with private key
+        function decryptWithPrivateKey(encryptedBase64, privateKey) {
             try {
-                const key = deriveKey(password);
-                const bytes = CryptoJS.AES.decrypt(encryptedData, key);
-                return bytes.toString(CryptoJS.enc.Utf8);
-            } catch (e) {
+                const encrypted = forge.util.decode64(encryptedBase64);
+                const decrypted = privateKey.decrypt(encrypted, 'RSA-OAEP', {
+                    md: forge.md.sha256.create(),
+                    mgf1: {
+                        md: forge.md.sha256.create()
+                    }
+                });
+                return decrypted;
+            } catch (error) {
+                console.error('Decryption error:', error);
                 return null;
             }
-        }
-        
-        // Fisher-Yates shuffle
-        function shuffle(array) {
-            const arr = [...array];
-            for (let i = arr.length - 1; i > 0; i--) {
-                const j = Math.floor(Math.random() * (i + 1));
-                [arr[i], arr[j]] = [arr[j], arr[i]];
-            }
-            return arr;
-        }
-        
-        // Generate Secret Santa assignments
-        function generateAssignments(participants) {
-            const usernames = participants.map(p => p.username);
-            let assignments = shuffle(usernames);
-            
-            // Ensure no one gets themselves
-            for (let i = 0; i < usernames.length; i++) {
-                if (assignments[i] === usernames[i]) {
-                    if (i === usernames.length - 1) {
-                        [assignments[i], assignments[i - 1]] = [assignments[i - 1], assignments[i]];
-                    } else {
-                        [assignments[i], assignments[i + 1]] = [assignments[i + 1], assignments[i]];
-                    }
-                }
-            }
-            
-            return usernames.map((username, i) => ({
-                username,
-                assignment: assignments[i]
-            }));
         }
         
         // Show view
@@ -427,12 +434,28 @@
             
             const username = document.getElementById('regUsername').value;
             const password = document.getElementById('regPassword').value;
+            const submitButton = e.target.querySelector('button[type="submit"]');
             
             try {
+                submitButton.disabled = true;
+                submitButton.textContent = 'Generating encryption keys...';
+                
+                // Generate deterministic RSA key pair
+                const keypair = deriveKeyPairFromPassword(username, password, roomId);
+                
+                // Export public key
+                const publicKeyPem = exportPublicKey(keypair.publicKey);
+                
+                submitButton.textContent = 'Registering...';
+                
                 const response = await fetch(`/api/rooms/${roomId}/register`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username, password })
+                    body: JSON.stringify({ 
+                        username, 
+                        password,
+                        publicKey: publicKeyPem
+                    })
                 });
                 
                 const data = await response.json();
@@ -464,6 +487,7 @@
                         showParticipantManagementView(data.roomDetails);
                     } else {
                         // New registration
+                        alert('✅ Registered successfully!\n\nRemember your password - you\'ll need it to decrypt your assignment later.');
                         document.getElementById('registerForm').classList.add('hidden');
                         document.getElementById('registerSuccess').classList.remove('hidden');
                     }
@@ -471,7 +495,11 @@
                     alert('Error: ' + data.error);
                 }
             } catch (error) {
+                console.error('Registration error:', error);
                 alert('Error registering: ' + error.message);
+            } finally {
+                submitButton.disabled = false;
+                submitButton.textContent = 'Register';
             }
         });
         
@@ -634,33 +662,26 @@
                 return;
             }
             
-            if (!confirm(`Start the Secret Santa room? This will lock participant registration and generate assignments.`)) {
+            if (!confirm(`Start the Secret Santa draw with ${currentRoom.participants.length} participants?\n\nOnce started:\n- No more participants can join\n- Assignments will be generated automatically by the server\n- Participants can log in to see their assignments`)) {
                 return;
             }
             
+            const startButton = document.querySelector('button[onclick="startRoom()"]');
+            
             try {
+                startButton.disabled = true;
+                startButton.textContent = 'Starting...';
+                
                 // Refresh to get latest participants
                 await refreshParticipants();
                 
-                // Generate assignments
-                const assignments = generateAssignments(currentRoom.participants);
-                
-                // Encrypt with username + roomId as key
-                const encryptedAssignments = assignments.map(a => {
-                    const encryptedAssignment = encryptData(a.assignment, a.username + roomId);
-                    return {
-                        username: a.username,
-                        encryptedAssignment
-                    };
-                });
-                
+                // Server will generate and encrypt assignments
                 const response = await fetch(`/api/rooms/${roomId}/start`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ 
                         hostUsername: currentHostUsername,
-                        hostPassword: currentHostPassword,
-                        encryptedAssignments
+                        hostPassword: currentHostPassword
                     })
                 });
                 
@@ -669,12 +690,16 @@
                 if (response.ok) {
                     document.getElementById('startRoomSection').classList.add('hidden');
                     document.getElementById('roomStartedMessage').classList.remove('hidden');
-                    alert('Room started! Participants can now sign in to see their assignments.');
+                    alert('🎉 Room started!\n\nAssignments have been generated and encrypted by the server.\nParticipants can now log in to see who they\'re buying for!');
                 } else {
                     alert('Error: ' + data.error);
+                    startButton.disabled = false;
+                    startButton.textContent = 'Start Secret Santa Draw';
                 }
             } catch (error) {
                 alert('Error starting room: ' + error.message);
+                startButton.disabled = false;
+                startButton.textContent = 'Start Secret Santa Draw';
             }
         }
         
@@ -684,8 +709,12 @@
             
             const username = document.getElementById('loginUsername').value;
             const password = document.getElementById('loginPassword').value;
+            const submitButton = e.target.querySelector('button[type="submit"]');
             
             try {
+                submitButton.disabled = true;
+                submitButton.textContent = 'Logging in...';
+                
                 const response = await fetch(`/api/rooms/${roomId}/login`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -695,21 +724,36 @@
                 const data = await response.json();
                 
                 if (response.ok) {
-                    // Decrypt assignment
-                    const decrypted = decryptData(data.encryptedAssignment, username + roomId);
+                    submitButton.textContent = 'Decrypting assignment...';
                     
-                    if (decrypted) {
-                        document.getElementById('loggedInUsername').textContent = username;
-                        document.getElementById('assignedPerson').textContent = decrypted;
-                        showView('assignmentView');
-                    } else {
-                        alert('Error decrypting assignment. Please contact the host.');
+                    // Re-derive the same private key from password
+                    const keypair = deriveKeyPairFromPassword(username, password, roomId);
+                    
+                    // Decrypt assignment with private key
+                    const assignment = decryptWithPrivateKey(data.encryptedAssignment, keypair.privateKey);
+                    
+                    if (!assignment) {
+                        alert('❌ Failed to decrypt assignment.\n\nThis usually means:\n1. Wrong password\n2. You registered with a different password\n\nPlease try again with the correct password.');
+                        submitButton.disabled = false;
+                        submitButton.textContent = 'Login';
+                        return;
                     }
+                    
+                    // Display assignment
+                    document.getElementById('loggedInUsername').textContent = username;
+                    document.getElementById('assignedPerson').textContent = assignment;
+                    document.getElementById('assignmentView').classList.add('reveal-animation');
+                    showView('assignmentView');
                 } else {
                     alert('Error: ' + data.error);
+                    submitButton.disabled = false;
+                    submitButton.textContent = 'Login';
                 }
             } catch (error) {
+                console.error('Login error:', error);
                 alert('Error logging in: ' + error.message);
+                submitButton.disabled = false;
+                submitButton.textContent = 'Login';
             }
         });
         

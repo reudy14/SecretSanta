@@ -4,6 +4,7 @@ const { v4: uuidv4 } = require('uuid');
 const cors = require('cors');
 const fs = require('fs').promises;
 const crypto = require('crypto');
+const forge = require('node-forge');
 
 const app = express();
 const PORT = process.env.PORT || 8003;
@@ -172,16 +173,6 @@ app.post('/api/rooms', async (req, res) => {
       createdAt: new Date().toISOString()
     };
 
-    // Auto-join host if requested
-    if (autoJoinHost) {
-      const hostPasswordHash = hashPassword(hostPassword);
-      room.participants.push({
-        username: sanitizedUsername,
-        passwordHash: hostPasswordHash,
-        encryptedAssignment: null
-      });
-    }
-
     rooms.set(roomId, room);
     await saveData();
     
@@ -225,7 +216,7 @@ app.post('/api/rooms/:id/register', async (req, res) => {
       return res.status(429).json({ error: 'Too many requests. Please wait a minute.' });
     }
 
-    const { username, password } = req.body;
+    const { username, password, publicKey } = req.body;
     const roomId = req.params.id;
     
     if (!username || !password) {
@@ -245,22 +236,30 @@ app.post('/api/rooms/:id/register', async (req, res) => {
     const sanitizedUsername = validateUsername(username);
     validatePassword(password);
 
-    // Check if this is the host trying to log in
+    // Check if this is the host trying to register/log in
     const hostLoginHash = hashPassword(sanitizedUsername + password);
-    if (hostLoginHash === room.hostLoginHash) {
-      return res.json({
-        success: true,
-        isHost: true,
-        message: 'Host authenticated successfully',
-        username: sanitizedUsername,
-        roomDetails: {
-          id: room.id,
-          name: room.name,
-          hostUsername: room.hostUsername,
-          participants: room.participants.map(p => ({ username: p.username })),
-          status: room.status
-        }
-      });
+    const isHost = hostLoginHash === room.hostLoginHash;
+    
+    // If host is trying to log in and already registered, return their info
+    if (isHost) {
+      const existingHostParticipant = room.participants.find(p => p.username === sanitizedUsername);
+      if (existingHostParticipant) {
+        return res.json({
+          success: true,
+          isHost: true,
+          alreadyRegistered: true,
+          message: 'Host authenticated successfully',
+          username: sanitizedUsername,
+          roomDetails: {
+            id: room.id,
+            name: room.name,
+            hostUsername: room.hostUsername,
+            participants: room.participants.map(p => ({ username: p.username })),
+            status: room.status
+          }
+        });
+      }
+      // If host is registering for the first time, continue to add them as a participant (don't return early)
     }
 
     // Check if username already exists
@@ -285,10 +284,16 @@ app.post('/api/rooms/:id/register', async (req, res) => {
       });
     }
 
+    // Validate public key if provided
+    if (!publicKey || typeof publicKey !== 'string') {
+      return res.status(400).json({ error: 'Public key is required for registration' });
+    }
+
     const passwordHash = hashPassword(password);
     room.participants.push({
       username: sanitizedUsername,
       passwordHash: passwordHash,
+      publicKey: publicKey,
       encryptedAssignment: null
     });
 
@@ -297,9 +302,16 @@ app.post('/api/rooms/:id/register', async (req, res) => {
     res.json({ 
       success: true,
       alreadyRegistered: false,
-      isHost: false,
+      isHost: isHost,
       message: 'Registered successfully',
-      username: sanitizedUsername
+      username: sanitizedUsername,
+      roomDetails: {
+        id: room.id,
+        name: room.name,
+        hostUsername: room.hostUsername,
+        participants: room.participants.map(p => ({ username: p.username })),
+        status: room.status
+      }
     });
   } catch (error) {
     console.error('Error registering participant:', error);
@@ -391,11 +403,11 @@ app.post('/api/rooms/:id/remove-participant', async (req, res) => {
 // Start room and generate assignments (host only)
 app.post('/api/rooms/:id/start', async (req, res) => {
   try {
-    const { hostUsername, hostPassword, encryptedAssignments } = req.body;
+    const { hostUsername, hostPassword } = req.body;
     const roomId = req.params.id;
     
-    if (!hostUsername || !hostPassword || !encryptedAssignments) {
-      return res.status(400).json({ error: 'Host username, password and encrypted assignments are required' });
+    if (!hostUsername || !hostPassword) {
+      return res.status(400).json({ error: 'Host username and password are required' });
     }
 
     const room = rooms.get(roomId);
@@ -416,10 +428,51 @@ app.post('/api/rooms/:id/start', async (req, res) => {
       return res.status(400).json({ error: 'At least 2 participants are required' });
     }
 
-    encryptedAssignments.forEach(({ username, encryptedAssignment }) => {
-      const participant = room.participants.find(p => p.username === username);
+    // Verify all participants have public keys
+    const missingKeys = room.participants.filter(p => !p.publicKey);
+    if (missingKeys.length > 0) {
+      return res.status(400).json({ 
+        error: `Some participants are missing public keys: ${missingKeys.map(p => p.username).join(', ')}. They need to re-register.` 
+      });
+    }
+
+    // Generate assignments on server
+    const assignments = generateSecretSantaAssignments(room.participants);
+
+    // Encrypt each assignment with participant's public key
+    const encryptedAssignments = assignments.map(assignment => {
+      const participant = room.participants.find(p => p.username === assignment.username);
+      
+      try {
+        // Import public key
+        const publicKey = forge.pki.publicKeyFromPem(participant.publicKey);
+        
+        // Encrypt the assignment
+        const encrypted = publicKey.encrypt(assignment.giftRecipient, 'RSA-OAEP', {
+          md: forge.md.sha256.create(),
+          mgf1: {
+            md: forge.md.sha256.create()
+          }
+        });
+        
+        // Convert to base64
+        const encryptedBase64 = forge.util.encode64(encrypted);
+        
+        return {
+          username: assignment.username,
+          encryptedAssignment: encryptedBase64
+        };
+      } catch (error) {
+        console.error(`Error encrypting for ${assignment.username}:`, error);
+        throw new Error(`Failed to encrypt assignment for ${assignment.username}`);
+      }
+    });
+
+    // Update participants with encrypted assignments
+    encryptedAssignments.forEach(ea => {
+      const participant = room.participants.find(p => p.username === ea.username);
       if (participant) {
-        participant.encryptedAssignment = encryptedAssignment;
+        participant.encryptedAssignment = ea.encryptedAssignment;
       }
     });
 
@@ -428,14 +481,52 @@ app.post('/api/rooms/:id/start', async (req, res) => {
     
     res.json({ 
       success: true,
-      message: 'Room started successfully',
-      status: room.status
+      message: 'Room started and assignments generated',
+      status: room.status,
+      participantCount: room.participants.length
     });
   } catch (error) {
     console.error('Error starting room:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: error.message || 'Internal server error' });
   }
 });
+
+// Helper function to generate Secret Santa assignments
+function generateSecretSantaAssignments(participants) {
+  const usernames = participants.map(p => p.username);
+  let assignments = [];
+  let attempts = 0;
+  const maxAttempts = 100;
+
+  while (attempts < maxAttempts) {
+    assignments = [];
+    const shuffled = [...usernames].sort(() => Math.random() - 0.5);
+    let valid = true;
+
+    for (let i = 0; i < usernames.length; i++) {
+      const giver = usernames[i];
+      const receiver = shuffled[i];
+
+      if (giver === receiver) {
+        valid = false;
+        break;
+      }
+
+      assignments.push({
+        username: giver,
+        giftRecipient: receiver
+      });
+    }
+
+    if (valid) {
+      return assignments;
+    }
+
+    attempts++;
+  }
+
+  throw new Error('Failed to generate valid Secret Santa assignments');
+}
 
 // Participant login and get assignment
 app.post('/api/rooms/:id/login', (req, res) => {
