@@ -195,11 +195,11 @@
         createSnowflakes();
         
         // Derive deterministic RSA key pair from password (same as room.html)
-        function deriveKeyPairFromPassword(username, password, roomId) {
+        function deriveKeyPairFromPassword(username, password, roomId, keySalt) {
             const seed = username + password + roomId;
-            const keyMaterial = CryptoJS.PBKDF2(seed, 'secret-santa-salt-2025', {
+            const keyMaterial = CryptoJS.PBKDF2(seed, keySalt, {
                 keySize: 512/32,
-                iterations: 1000
+                iterations: 100000  // Increased from 1000 for security
             }).toString();
             const seedBytes = forge.util.hexToBytes(keyMaterial);
             const prng = forge.random.createInstance();
@@ -260,28 +260,49 @@
                     
                     // If auto-join was checked, register the host
                     if (autoJoinHost) {
-                        submitButton.textContent = 'Generating encryption keys...';
+                        submitButton.textContent = '📡 Requesting encryption parameters...';
                         
-                        // Generate RSA keypair
-                        const keypair = deriveKeyPairFromPassword(hostUsername, hostPassword, roomId);
-                        const publicKeyPem = exportPublicKey(keypair.publicKey);
-                        
-                        submitButton.textContent = 'Registering host...';
-                        
-                        // Register host as participant
-                        const registerResponse = await fetch(`/api/rooms/${roomId}/register`, {
+                        // Step 1: Get keySalt from server
+                        const initResponse = await fetch(`/api/rooms/${roomId}/init-register`, {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
                                 username: hostUsername,
-                                password: hostPassword,
-                                publicKey: publicKeyPem
+                                password: hostPassword
                             })
                         });
                         
-                        if (!registerResponse.ok) {
-                            const regError = await registerResponse.json();
-                            alert('Room created but failed to register host: ' + regError.error);
+                        if (!initResponse.ok) {
+                            const initError = await initResponse.json();
+                            alert('Room created but failed to initialize registration: ' + initError.error);
+                        } else {
+                            const initData = await initResponse.json();
+                            const keySalt = initData.keySalt;
+                            
+                            submitButton.textContent = '🔐 Generating encryption keys...';
+                            
+                            // Use setTimeout to allow UI to update
+                            await new Promise(resolve => setTimeout(resolve, 100));
+                            
+                            submitButton.textContent = '⚙️ Deriving cryptographic keys (this may take 10-15 seconds)...';
+                            
+                            // Step 2: Generate RSA keypair with keySalt from server
+                            const keypair = deriveKeyPairFromPassword(hostUsername, hostPassword, roomId, keySalt);
+                            const publicKeyPem = exportPublicKey(keypair.publicKey);
+                            
+                            submitButton.textContent = '📝 Completing registration...';
+                            
+                            // Step 3: Complete registration with real public key and keySalt
+                            await fetch(`/api/rooms/${roomId}/register`, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    username: hostUsername,
+                                    password: hostPassword,
+                                    publicKey: publicKeyPem,
+                                    keySalt: keySalt
+                                })
+                            });
                         }
                     }
                     

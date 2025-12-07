@@ -5,6 +5,9 @@ const cors = require('cors');
 const fs = require('fs').promises;
 const crypto = require('crypto');
 const forge = require('node-forge');
+const bcrypt = require('bcrypt');
+
+const BCRYPT_ROUNDS = 12;
 
 const app = express();
 const PORT = process.env.PORT || 8003;
@@ -74,14 +77,19 @@ async function saveData() {
   }
 }
 
-// Hash password using SHA-256
-function hashPassword(password) {
-  return crypto.createHash('sha256').update(password).digest('hex');
+// Generate random salt for key derivation
+function generateKeySalt() {
+  return crypto.randomBytes(32).toString('hex');
 }
 
-// Verify password
-function verifyPassword(password, hash) {
-  return hashPassword(password) === hash;
+// Hash password using bcrypt
+async function hashPassword(password) {
+  return await bcrypt.hash(password, BCRYPT_ROUNDS);
+}
+
+// Verify password using bcrypt
+async function verifyPassword(password, hash) {
+  return await bcrypt.compare(password, hash);
 }
 
 // Validation helpers
@@ -161,7 +169,7 @@ app.post('/api/rooms', async (req, res) => {
     validatePassword(hostPassword);
 
     const roomId = uuidv4();
-    const hostLoginHash = hashPassword(sanitizedUsername + hostPassword);
+    const hostLoginHash = await hashPassword(sanitizedUsername + hostPassword);
     
     const room = {
       id: roomId,
@@ -208,6 +216,55 @@ app.get('/api/rooms/:id', (req, res) => {
   });
 });
 
+// Initialize registration - get keySalt for participant
+app.post('/api/rooms/:id/init-register', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const roomId = req.params.id;
+    
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Username and password are required' });
+    }
+
+    const room = rooms.get(roomId);
+    if (!room) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+
+    if (room.status === 'started') {
+      return res.status(400).json({ error: 'Room has already started. Registration is closed.' });
+    }
+
+    // Validate inputs
+    const sanitizedUsername = validateUsername(username);
+    validatePassword(password);
+
+    // Check if user already exists - return their keySalt
+    const existingParticipant = room.participants.find(p => p.username === sanitizedUsername);
+    if (existingParticipant) {
+      // Verify password
+      if (!(await verifyPassword(password, existingParticipant.passwordHash))) {
+        return res.status(401).json({ error: 'Invalid password for this username' });
+      }
+      return res.json({ 
+        keySalt: existingParticipant.keySalt,
+        alreadyExists: true
+      });
+    }
+
+    // Generate new keySalt for new user
+    const keySalt = generateKeySalt();
+    
+    res.json({ 
+      keySalt: keySalt,
+      alreadyExists: false
+    });
+  } catch (error) {
+    console.error('Error initializing registration:', error);
+    res.status(400).json({ error: error.message || 'Invalid request data' });
+  }
+});
+
 // Register participant in room
 app.post('/api/rooms/:id/register', async (req, res) => {
   try {
@@ -237,8 +294,8 @@ app.post('/api/rooms/:id/register', async (req, res) => {
     validatePassword(password);
 
     // Check if this is the host trying to register/log in
-    const hostLoginHash = hashPassword(sanitizedUsername + password);
-    const isHost = hostLoginHash === room.hostLoginHash;
+    const hostLoginHash = sanitizedUsername + password;
+    const isHost = await verifyPassword(hostLoginHash, room.hostLoginHash);
     
     // If host is trying to log in and already registered, return their info
     if (isHost) {
@@ -265,8 +322,17 @@ app.post('/api/rooms/:id/register', async (req, res) => {
     // Check if username already exists
     const existingParticipant = room.participants.find(p => p.username === sanitizedUsername);
     if (existingParticipant) {
-      if (!verifyPassword(password, existingParticipant.passwordHash)) {
+      if (!(await verifyPassword(password, existingParticipant.passwordHash))) {
         return res.status(401).json({ error: 'Invalid password for this username' });
+      }
+      
+      // If public key is valid and provided, update it (in case they're re-registering)
+      if (publicKey && typeof publicKey === 'string' && publicKey !== 'temp') {
+        existingParticipant.publicKey = publicKey;
+        if (req.body.keySalt) {
+          existingParticipant.keySalt = req.body.keySalt;
+        }
+        await saveData();
       }
       
       return res.json({ 
@@ -275,6 +341,7 @@ app.post('/api/rooms/:id/register', async (req, res) => {
         isHost: false,
         message: 'Signed in successfully',
         username: sanitizedUsername,
+        keySalt: existingParticipant.keySalt,
         roomDetails: {
           id: room.id,
           name: room.name,
@@ -289,11 +356,19 @@ app.post('/api/rooms/:id/register', async (req, res) => {
       return res.status(400).json({ error: 'Public key is required for registration' });
     }
 
-    const passwordHash = hashPassword(password);
+    // Validate keySalt if provided (from init-register), otherwise generate new one
+    let keySalt = req.body.keySalt;
+    if (!keySalt || typeof keySalt !== 'string') {
+      keySalt = generateKeySalt();
+    }
+
+    const passwordHash = await hashPassword(password);
+    
     room.participants.push({
       username: sanitizedUsername,
       passwordHash: passwordHash,
       publicKey: publicKey,
+      keySalt: keySalt,
       encryptedAssignment: null
     });
 
@@ -305,6 +380,7 @@ app.post('/api/rooms/:id/register', async (req, res) => {
       isHost: isHost,
       message: 'Registered successfully',
       username: sanitizedUsername,
+      keySalt: keySalt,
       roomDetails: {
         id: room.id,
         name: room.name,
@@ -320,7 +396,7 @@ app.post('/api/rooms/:id/register', async (req, res) => {
 });
 
 // Host authentication and get room details
-app.post('/api/rooms/:id/host-auth', (req, res) => {
+app.post('/api/rooms/:id/host-auth', async (req, res) => {
   try {
     const { username, password } = req.body;
     const roomId = req.params.id;
@@ -334,8 +410,8 @@ app.post('/api/rooms/:id/host-auth', (req, res) => {
       return res.status(404).json({ error: 'Room not found' });
     }
 
-    const loginHash = hashPassword(username + password);
-    if (loginHash !== room.hostLoginHash) {
+    const loginHash = username + password;
+    if (!(await verifyPassword(loginHash, room.hostLoginHash))) {
       return res.status(401).json({ error: 'Invalid host credentials' });
     }
 
@@ -415,8 +491,8 @@ app.post('/api/rooms/:id/start', async (req, res) => {
       return res.status(404).json({ error: 'Room not found' });
     }
 
-    const loginHash = hashPassword(hostUsername + hostPassword);
-    if (loginHash !== room.hostLoginHash) {
+    const loginHash = hostUsername + hostPassword;
+    if (!(await verifyPassword(loginHash, room.hostLoginHash))) {
       return res.status(401).json({ error: 'Invalid host credentials' });
     }
 
@@ -529,7 +605,7 @@ function generateSecretSantaAssignments(participants) {
 }
 
 // Participant login and get assignment
-app.post('/api/rooms/:id/login', (req, res) => {
+app.post('/api/rooms/:id/login', async (req, res) => {
   try {
     const { username, password } = req.body;
     const roomId = req.params.id;
@@ -548,7 +624,7 @@ app.post('/api/rooms/:id/login', (req, res) => {
       return res.status(404).json({ error: 'User not found in this room' });
     }
 
-    if (!verifyPassword(password, participant.passwordHash)) {
+    if (!(await verifyPassword(password, participant.passwordHash))) {
       return res.status(401).json({ error: 'Invalid password' });
     }
 
@@ -563,6 +639,7 @@ app.post('/api/rooms/:id/login', (req, res) => {
       success: true,
       username: participant.username,
       roomName: room.name,
+      keySalt: participant.keySalt,
       encryptedAssignment: participant.encryptedAssignment
     });
   } catch (error) {
